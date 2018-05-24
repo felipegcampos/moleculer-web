@@ -627,7 +627,7 @@ describe("Test aliases", () => {
 	let service;
 	let server;
 
-	let customAlias = jest.fn((req, res) => {
+	let customAlias = jest.fn((route, ctx, req, res) => {
 		expect(req.$route).toBeDefined();
 		expect(req.$service).toBe(service);
 		expect(req.$params).toEqual({
@@ -637,14 +637,8 @@ describe("Test aliases", () => {
 		expect(res.$route).toBeDefined();
 		expect(res.$service).toBe(service);
 
-		res.end(`Custom Alias by ${req.$params.name}`);
+		return `Custom Alias by ${req.$params.name}`;
 	});
-
-	let customMiddlewares = [
-		jest.fn((req, res, next) => next()),
-		jest.fn((req, res, next) => next()),
-		"test.greeter"
-	];
 
 	beforeAll(() => {
 		[ broker, service, server] = setup({
@@ -660,8 +654,6 @@ describe("Test aliases", () => {
 					"/repeat-test/:args*": "test.echo",
 					"GET /": "test.hello",
 					"GET custom": customAlias,
-					"GET /middleware": customMiddlewares,
-					"GET /wrong-middleware": [customMiddlewares[0], customMiddlewares[1]],
 					"GET reqres": {
 						action: "test.reqres",
 						passReqResToParams: true
@@ -853,47 +845,9 @@ describe("Test aliases", () => {
 			.query({ name: "Ben" })
 			.expect(200)
 			.then(res => {
-				expect(res.text).toBe("Custom Alias by Ben");
+				expect(res.body).toBe("Custom Alias by Ben");
 				expect(customAlias).toHaveBeenCalledTimes(1);
-				expect(customAlias).toHaveBeenCalledWith(jasmine.any(http.IncomingMessage), jasmine.any(http.ServerResponse), jasmine.any(Function));
-			});
-	});
-
-	it("GET /api/middleware", () => {
-		return request(server)
-			.get("/api/middleware")
-			.query({ name: "Ben" })
-			.expect(200)
-			.then(res => {
-				expect(res.body).toBe("Hello Ben");
-
-				expect(customMiddlewares[0]).toHaveBeenCalledTimes(1);
-				expect(customMiddlewares[0]).toHaveBeenCalledWith(jasmine.any(http.IncomingMessage), jasmine.any(http.ServerResponse), jasmine.any(Function));
-
-				expect(customMiddlewares[1]).toHaveBeenCalledTimes(1);
-				expect(customMiddlewares[1]).toHaveBeenCalledWith(jasmine.any(http.IncomingMessage), jasmine.any(http.ServerResponse), jasmine.any(Function));
-			});
-	});
-
-	it("GET /api/wrong-middleware", () => {
-		customMiddlewares[0].mockClear();
-		customMiddlewares[1].mockClear();
-
-		return request(server)
-			.get("/api/wrong-middleware")
-			.expect(500)
-			.then(res => {
-				expect(res.body).toEqual({
-					"name": "MoleculerServerError",
-					"message": "No alias handler",
-					"code": 500,
-				});
-
-				expect(customMiddlewares[0]).toHaveBeenCalledTimes(1);
-				expect(customMiddlewares[0]).toHaveBeenCalledWith(jasmine.any(http.IncomingMessage), jasmine.any(http.ServerResponse), jasmine.any(Function));
-
-				expect(customMiddlewares[1]).toHaveBeenCalledTimes(1);
-				expect(customMiddlewares[1]).toHaveBeenCalledWith(jasmine.any(http.IncomingMessage), jasmine.any(http.ServerResponse), jasmine.any(Function));
+				expect(customAlias).toHaveBeenCalledWith(jasmine.any(Context), jasmine.any(Object), jasmine.any(http.IncomingMessage), jasmine.any(http.ServerResponse));
 			});
 	});
 
@@ -1417,7 +1371,7 @@ describe("Test CORS", () => {
 					"code": 404,
 					"type": "ERR_ORIGIN_NOT_FOUND",
 					"name": "NotFoundError"});
-			});;
+			});
 	});
 
 	it("errors on mismatching origin header", () => {
@@ -1436,7 +1390,7 @@ describe("Test CORS", () => {
 					"code": 403,
 					"type": "ERR_ORIGIN_NOT_ALLOWED",
 					"name": "ForbiddenError"});
-			});;
+			});
 	});
 
 	it("with default settings", () => {

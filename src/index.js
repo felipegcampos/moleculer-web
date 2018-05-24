@@ -9,7 +9,6 @@
 const http 						= require("http");
 const https 					= require("https");
 const queryString 				= require("qs");
-const deprecate 				= require("depd")("moleculer-web");
 
 const _ 						= require("lodash");
 const bodyParser 				= require("body-parser");
@@ -19,7 +18,7 @@ const isReadableStream			= require("isstream").isReadable;
 const pathToRegexp 				= require("path-to-regexp");
 
 const { Context } 				= require("moleculer");
-const { MoleculerError, MoleculerServerError, ServiceNotFoundError } = require("moleculer").Errors;
+const { MoleculerError, ServiceNotFoundError } = require("moleculer").Errors;
 const { BadRequestError, NotFoundError, ForbiddenError, RateLimitExceeded, ERR_UNABLE_DECODE_PARAM, ERR_ORIGIN_NOT_FOUND, ERR_ORIGIN_NOT_ALLOWED } = require("./errors");
 
 const MemoryStore				= require("./memory-store");
@@ -250,17 +249,8 @@ module.exports = {
 					alias = { action };
 				else if (_.isFunction(action))
 					alias = { handler: action };
-				else if (Array.isArray(action)) {
-					let mws = action.map(mw => {
-						if (_.isString(mw))
-							return (req, res) => this.preActionCall(route, req, res, mw);
-						else if(_.isFunction(mw))
-							return mw;
-					});
-					alias = { handler: this.compose(...mws) };
-				} else {
+				else
 					alias = action;
-				}
 
 				alias.path = matchPath;
 				alias.method = method;
@@ -307,7 +297,6 @@ module.exports = {
 						route.aliases.push(createAlias(`GET ${pathName}/:id`, 		`${action}.get`));
 						route.aliases.push(createAlias(`POST ${pathName}`, 			`${action}.create`));
 						route.aliases.push(createAlias(`PUT ${pathName}/:id`, 		`${action}.update`));
-						//route.aliases.push(createAlias(`PATCH ${pathName}/:id`, 	`${action}.patch`));
 						route.aliases.push(createAlias(`DELETE ${pathName}/:id`, 	`${action}.remove`));
 
 					} else {
@@ -386,7 +375,6 @@ module.exports = {
 				"Content-Length": "0"
 			});
 			res.end();
-			//this.logResponse(req, res);
 		},
 
 		/**
@@ -486,7 +474,7 @@ module.exports = {
 									urlPath = urlPath.slice(1);
 
 								urlPath = urlPath.replace(/~/, "$");
-								let actionName = urlPath;
+								let action = urlPath;
 
 								// Resolve aliases
 								if (route.aliases && route.aliases.length > 0) {
@@ -496,28 +484,9 @@ module.exports = {
 										this.logger.debug(`  Alias: ${req.method} ${urlPath} -> ${alias.action}`);
 										Object.assign(params, found.params);
 
+										action = alias.handler || alias.action;
+										
 										req.$alias = alias;
-
-										// Custom Action handler
-										if (alias.handler) {
-											return alias.handler.call(this, req, res, err => {
-												if (err) {
-													const error = new MoleculerError(err.message, err.status, err.type);
-													this.logger.error("Alias middleware error!", error);
-													return this.sendError(req, res, error);
-												}
-
-												if (req.$next)
-													return req.$next();
-
-												// If it is reached, there is no real handler for this alias.
-												const error = new MoleculerServerError("No alias handler", 500);
-												this.logger.error(error);
-												return this.sendError(req, res, error);
-											});
-										}
-
-										actionName = alias.action;
 
 									} else if (route.mappingPolicy == MAPPING_POLICY_RESTRICT) {
 										// Blocking direct access
@@ -529,13 +498,15 @@ module.exports = {
 									return this.send404(req, res);
 								}
 
-								actionName = actionName.replace(/\//g, ".");
+								if (_.isString(action)) {
+									action = action.replace(/\//g, ".");
 
-								if (route.opts.camelCaseNames) {
-									actionName = actionName.split(".").map(_.camelCase).join(".");
+									if (route.opts.camelCaseNames) {
+										action = action.split(".").map(_.camelCase).join(".");
+									}
 								}
 
-								this.preActionCall(route, req, res, actionName);
+								this.preActionCall(route, req, res, action);
 							});
 
 							return;
@@ -562,27 +533,15 @@ module.exports = {
 		},
 
 		/**
-		 * Route handler.
-		 * 	- check whitelist
-		 * 	- CORS
+		 * Generic route handler
 		 * 	- Rate limiter
-		 *
-		 * @param {Object} route
-		 * @param {HttpRequest} req
-		 * @param {HttpResponse} res
-		 * @param {String} actionName
-		 * @returns
+		 * 
+		 * @param {Object} route 		Route options
+		 * @param {HttpRequest} req 	Request object
+		 * @param {HttpResponse} res 	Response object
+		 * @param {*} action 
 		 */
-		preActionCall(route, req, res, actionName) {
-
-			// Whitelist check
-			if (route.hasWhitelist) {
-				if (!this.checkWhitelist(route, actionName)) {
-					this.logger.debug(`  The '${actionName}' action is not in the whitelist!`);
-					return this.sendError(req, res, new ServiceNotFoundError(actionName));
-				}
-			}
-
+		preActionCall(route, req, res, action) {
 			// Rate limiter
 			if (route.rateLimit) {
 				const opts = route.rateLimit;
@@ -602,8 +561,142 @@ module.exports = {
 				}
 			}
 
-			// Call the action
-			return this.callAction(route, actionName, req, res, req.$params);
+			if (_.isString(action)) {
+				try {
+					action = this.checkActionString(route, req, res, action);
+				} catch(err) {
+					return this.sendError(req, res, err);
+				}
+			}
+
+			this.callAction(route, req, res, action, req.$params);
+		},
+
+		/**
+		 * Check action name
+		 * 	- Whitelist
+		 * 	- Resolve
+		 * 	- Validate endpoint params
+		 * 
+		 * @param {Object} route 		Route options
+		 * @param {HttpRequest} req 	Request object
+		 * @param {HttpResponse} res 	Response object
+		 * @param {String} actionName	
+		 */
+		checkActionString(route, req, res, actionName) {
+			// Whitelist check
+			if (route.hasWhitelist) {
+				if (!this.checkWhitelist(route, actionName)) {
+					this.logger.debug(`  The '${actionName}' action is not in the whitelist!`);
+					throw new ServiceNotFoundError(actionName);
+				}
+			}
+
+			// Resolve action by name
+			let endpoint = this.broker.findNextActionEndpoint(actionName);
+			if (endpoint instanceof Error)
+				throw endpoint;
+
+			if (endpoint.action.publish === false) {
+				// Action is not publishable
+				throw new ServiceNotFoundError(actionName);
+			}
+
+			// Validate params if neccessary
+			if (this.settings.preValidate && this.broker.validator && endpoint.action.params)
+				this.broker.validator.validate(req.$params, endpoint.action.params);
+
+			req.$endpoint = endpoint;
+
+			return endpoint;
+		},
+
+		/**
+		 * Call an action eiter via broker or custom function
+		 * 
+		 * @param {Object} route 		Route options
+		 * @param {HttpRequest} req 	Request object
+		 * @param {HttpResponse} res 	Response object
+		 * @param {any} action			String, Endpoint or Function
+		 */
+		callAction(route, req, res, action, params) {
+			let ctx;
+			const p = this.Promise.resolve()
+
+				// Create a new context for request
+				.then(() => {
+					if (_.isFunction(action))
+						this.logger.info(`	Call <Function> in '${req.$alias.method} ${req.$alias.path}' alias`);
+					else
+						this.logger.info(`	Call '${action.actionName || action}' action`);
+
+					if (this.settings.logRequestParams && this.settings.logRequestParams in this.logger)
+						this.logger[this.settings.logRequestParams]("  Params:", params);
+
+					ctx = this.createRestContext(route, req, res, params);
+					ctx._metricStart(ctx.metrics);
+
+					return ctx;
+				})
+				// onBeforeCall handling
+				.then(() => {
+					if (route.onBeforeCall)
+						return route.onBeforeCall.call(this, ctx, route, req, res);
+				})
+				// Authorization
+				.then(() => {
+					if (route.authorization)
+						return this.authorize(ctx, route, req, res);
+				})
+				// Call the action
+				.then(() => {
+					if (_.isFunction(action))
+						return action.call(this, ctx, route, req, res);
+					else
+						return ctx.call(req.$endpoint, params, route.callOptions || {});
+				})
+				// Process the response
+				.then(data => {
+					res.statusCode = 200;
+
+					// Return with the response
+					if (ctx.requestID)
+						res.setHeader("X-Request-ID", ctx.requestID);
+
+					// onAfterCall handling
+					if (route.onAfterCall)
+						return route.onAfterCall.call(this, ctx, route, req, res, data);
+
+					return data;
+				})
+				// Send back the response
+				.then(data => {
+					this.sendResponse(ctx, route, req, res, data);
+
+					ctx._metricFinish(null, ctx.metrics);
+
+					this.logResponse(req, res, ctx, data);
+				})
+				// Error handling
+				.catch(err => {
+					if (!err)
+						return;
+
+					this.logger.error("  Request error!", err.name, ":", err.message, "\n", err.stack, "\nData:", err.data);
+
+					// Finish the context
+					if (ctx) {
+						res.setHeader("X-Request-ID", ctx.id);
+
+						ctx._metricFinish(err, ctx.metrics);
+					}
+
+					// Return with the error
+					this.sendError(req, res, err);
+				});
+
+
+			return p;
 		},
 
 		/**
@@ -642,116 +735,6 @@ module.exports = {
 		},
 
 		/**
-		 * Call an action via broker
-		 *
-		 * @param {Object} route 		Route options
-		 * @param {String} actionName 	Name of action
-		 * @param {HttpRequest} req 	Request object
-		 * @param {HttpResponse} res 	Response object
-		 * @param {Object} params		Merged query params + named parameters from URL
-		 * @returns {Promise}
-		 */
-		callAction(route, actionName, req, res, params) {
-			let endpoint, ctx;
-
-			const p = this.Promise.resolve()
-
-				// Create a new context for request
-				.then(() => {
-
-					this.logger.info(`  Call '${actionName}' action`);
-					if (this.settings.logRequestParams && this.settings.logRequestParams in this.logger)
-						this.logger[this.settings.logRequestParams]("  Params:", params);
-
-					ctx = this.createRestContext(route, req, res, params);
-					ctx._metricStart(ctx.metrics);
-
-					return ctx;
-				})
-
-				// Resolve action by name
-				.then(() => {
-					endpoint = this.broker.findNextActionEndpoint(actionName);
-					if (endpoint instanceof Error)
-						throw endpoint;
-
-					if (endpoint.action.publish === false) {
-						// Action is not publishable
-						throw new ServiceNotFoundError(actionName);
-					}
-
-					// Validate params if neccessary
-					if (this.settings.preValidate && this.broker.validator && endpoint.action.params)
-						this.broker.validator.validate(params, endpoint.action.params);
-
-					req.$endpoint = endpoint;
-
-					return endpoint;
-				})
-				// onBeforeCall handling
-				.then(() => {
-					if (route.onBeforeCall)
-						return route.onBeforeCall.call(this, ctx, route, req, res);
-				})
-
-				// Authorization
-				.then(() => {
-					if (route.authorization)
-						return this.authorize(ctx, route, req, res);
-				})
-
-				// Call the action
-				.then(() => ctx.call(endpoint, params, route.callOptions || {}))
-
-				// Process the response
-				.then(data => {
-					res.statusCode = 200;
-
-					// Return with the response
-					if (ctx.requestID)
-						res.setHeader("X-Request-ID", ctx.requestID);
-
-					//if (ctx.cachedResult)
-					//	res.setHeader("X-From-Cache", "true");
-
-					// onAfterCall handling
-					if (route.onAfterCall)
-						return route.onAfterCall.call(this, ctx, route, req, res, data);
-
-					return data;
-				})
-
-				// Send back the response
-				.then(data => {
-					this.sendResponse(ctx, route, req, res, data, endpoint.action);
-
-					ctx._metricFinish(null, ctx.metrics);
-
-					this.logResponse(req, res, ctx, data);
-				})
-
-				// Error handling
-				.catch(err => {
-					if (!err)
-						return;
-
-					this.logger.error("  Request error!", err.name, ":", err.message, "\n", err.stack, "\nData:", err.data);
-
-					// Finish the context
-					if (ctx) {
-						res.setHeader("X-Request-ID", ctx.id);
-
-						ctx._metricFinish(err, ctx.metrics);
-					}
-
-					// Return with the error
-					this.sendError(req, res, err);
-				});
-
-			return p;
-		},
-
-		/**
 		 * Convert data & send back to client
 		 *
 		 * @param {Context} ctx
@@ -759,9 +742,8 @@ module.exports = {
 		 * @param {HttpIncomingRequest} req
 		 * @param {HttpResponse} res
 		 * @param {any} data
-		 * @param {Object} action
 		 */
-		sendResponse(ctx, route, req, res, data, action) {
+		sendResponse(ctx, route, req, res, data) {
 			// Status code & message
 			if (ctx.meta.$statusCode) {
 				res.statusCode = ctx.meta.$statusCode;
@@ -779,21 +761,7 @@ module.exports = {
 					res.setHeader("Location", location);
 			}
 
-			// Override responseType by action (Deprecated)
-			let responseType = action.responseType;
-			if (responseType) {
-				deprecate("The 'responseType' in action definition is deprecated. Use 'ctx.meta.$responseType'");
-			}
-
-			// Custom headers (Deprecated)
-			if (action.responseHeaders) {
-				deprecate("The 'responseHeaders' in action definition is deprecated. Use 'ctx.meta.$responseHeaders'");
-				Object.keys(action.responseHeaders).forEach(key => {
-					res.setHeader(key, action.responseHeaders[key]);
-					if (key == "Content-Type" && !responseType)
-						responseType = action.responseHeaders[key];
-				});
-			}
+			let responseType;
 
 			// Custom responseType from ctx.meta
 			if (ctx.meta.$responseType) {
@@ -1039,7 +1007,7 @@ module.exports = {
 				}
 			}
 			return false;
-		}
+		},
 
 	},
 
